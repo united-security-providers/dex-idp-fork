@@ -158,6 +158,19 @@ fix: ## Fix lint violations.
 	@golangci-lint version
 	@golangci-lint fmt
 
+TRIVY_IMAGE ?= aquasec/trivy:0.70.0
+SCAN_IMAGE ?= dex-usp:latest
+TRIVY = docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v $(CURDIR):/w -w /w $(TRIVY_IMAGE)
+
+.PHONY: scan-image
+scan-image: ## Scan SCAN_IMAGE with Trivy, applying the CycloneDX VEX in dex.vex.cdx.json.
+	@mkdir -p bin/scan
+	@$(TRIVY) image --quiet -f cyclonedx $(SCAN_IMAGE) > bin/scan/sbom.cdx.json
+	@# Trivy only applies CycloneDX VEX through BOM-Links into the scanned SBOM.
+	@jq --arg s "$$(jq -r '.serialNumber | sub("^urn:uuid:"; "")' bin/scan/sbom.cdx.json)" \
+		'.vulnerabilities[].affects[].ref |= "urn:cdx:\($$s)/1#\(.)"' dex.vex.cdx.json > bin/scan/vex.cdx.json
+	@$(TRIVY) sbom --quiet --vex bin/scan/vex.cdx.json --show-suppressed bin/scan/sbom.cdx.json
+
 docker-compose.override.yaml:
 	cp docker-compose.override.yaml.dist docker-compose.override.yaml
 
