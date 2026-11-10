@@ -1,0 +1,124 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "serialNumber": "urn:uuid:3a9dbd82-6bef-4582-a87e-2640a89c386d",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-11-05T00:00:00Z",
+    "authors": [
+      {
+        "name": "Lukas Funk",
+        "email": "funkluk@users.noreply.github.com"
+      }
+    ],
+    "component": {
+      "type": "container",
+      "name": "dex-usp",
+      "bom-ref": "dex-usp"
+    }
+  },
+  "vulnerabilities": [
+    {
+      "id": "GO-2026-5932",
+      "source": {
+        "name": "Go Vulnerability Database",
+        "url": "https://pkg.go.dev/vuln/GO-2026-5932"
+      },
+      "analysis": {
+        "state": "not_affected",
+        "justification": "code_not_present",
+        "detail": "Deprecation notice for golang.org/x/crypto/openpgp. Neither /usr/local/bin/dex (only uses x/crypto/bcrypt) nor /usr/local/bin/gomplate links the openpgp package."
+      },
+      "affects": [
+        {
+          "ref": "pkg:golang/golang.org/x/crypto@v0.58.0"
+        }
+      ]
+    },
+    {
+      "id": "CVE-2026-116585",
+      "source": {
+        "name": "NVD",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-116585"
+      },
+      "analysis": {
+        "state": "not_affected",
+        "justification": "code_not_present",
+        "detail": "Only present in /usr/local/bin/gomplate, which does not link go-jose JWE decryption (CBC-HMAC) code; only JWK handling is compiled in."
+      },
+      "affects": [
+        {
+          "ref": "pkg:golang/github.com/go-jose/go-jose/v4@v4.1.4"
+        }
+      ]
+    },
+    {
+      "id": "CVE-2026-116586",
+      "source": {
+        "name": "NVD",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-116586"
+      },
+      "analysis": {
+        "state": "not_affected",
+        "justification": "requires_environment",
+        "detail": "Only present in /usr/local/bin/gomplate. The docker-entrypoint runs gomplate once at container start to render the operator-provided config template; it never parses untrusted JSON through go-jose."
+      },
+      "affects": [
+        {
+          "ref": "pkg:golang/github.com/go-jose/go-jose/v4@v4.1.4"
+        }
+      ]
+    },
+    {
+      "id": "CVE-2026-116587",
+      "source": {
+        "name": "NVD",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-116587"
+      },
+      "analysis": {
+        "state": "not_affected",
+        "justification": "requires_environment",
+        "detail": "Only present in /usr/local/bin/gomplate. The docker-entrypoint runs gomplate once at container start to render the operator-provided config template; it never parses untrusted JWKs. The dex binary uses the fixed go-jose v4.1.8."
+      },
+      "affects": [
+        {
+          "ref": "pkg:golang/github.com/go-jose/go-jose/v4@v4.1.4"
+        }
+      ]
+    },
+    {
+      "id": "CVE-2026-78661",
+      "source": {
+        "name": "NVD",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-78661"
+      },
+      "analysis": {
+        "state": "not_affected",
+        "justification": "code_not_present",
+        "detail": "Fix is in golang.org/x/net/html. Only /usr/local/bin/gomplate ships x/net v0.61.0 and it does not link x/net/html."
+      },
+      "affects": [
+        {
+          "ref": "pkg:golang/golang.org/x/net@v0.61.0"
+        }
+      ]
+    },
+    {
+      "id": "CVE-2026-97045",
+      "source": {
+        "name": "NVD",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-97045"
+      },
+      "analysis": {
+        "state": "not_affected",
+        "justification": "code_not_present",
+        "detail": "Fix is in golang.org/x/net/html. Only /usr/local/bin/gomplate ships x/net v0.61.0 and it does not link x/net/html."
+      },
+      "affects": [
+        {
+          "ref": "pkg:golang/golang.org/x/net@v0.61.0"
+        }
+      ]
+    }
+  ]
+}
