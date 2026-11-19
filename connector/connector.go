@@ -3,6 +3,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 )
@@ -38,6 +39,29 @@ func (e *UpstreamLogoutStatusError) Error() string {
 	}
 	return fmt.Sprintf("upstream logout failed with status %q", e.Status)
 }
+
+// UpstreamUnavailableError is returned by a connector when it cannot reach
+// its upstream identity provider, for example when fetching the issuer's
+// signing keys fails. Login, refresh and token exchange can all return it.
+// It says nothing about whether the credentials being checked are valid. A
+// token that does not verify can also cause it while the keys are unreachable,
+// because the connector fetches the keys again for a key ID it doesn't know.
+type UpstreamUnavailableError struct {
+	Err error
+}
+
+func (e *UpstreamUnavailableError) Error() string {
+	return fmt.Sprintf("upstream identity provider unavailable: %v", e.Err)
+}
+
+func (e *UpstreamUnavailableError) Unwrap() error {
+	return e.Err
+}
+
+// ErrUserRevoked is returned by a RefreshConnector when the upstream reports
+// that the user was deleted or disabled. The refresh grant answers it with
+// invalid_grant, so the client starts a new login instead of retrying.
+var ErrUserRevoked = errors.New("user was deleted or disabled upstream")
 
 // Connector is a mechanism for federating login to a remote identity service.
 //

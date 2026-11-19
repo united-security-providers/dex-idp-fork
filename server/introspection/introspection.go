@@ -313,7 +313,7 @@ func (h *Handler) sessionAlive(ctx context.Context, client storage.Client, subje
 }
 
 func (h *Handler) introspectAccessToken(ctx context.Context, token string) (*Introspection, error) {
-	verifier := oidc.NewVerifier(h.Issuer, &signer.KeySet{Signer: h.Signer}, &oidc.Config{SkipClientIDCheck: true})
+	verifier := oidc.NewVerifier(h.Issuer, &signer.KeySet{Signer: h.Signer, AcceptAccessTokens: true}, &oidc.Config{SkipClientIDCheck: true})
 	idToken, err := verifier.Verify(ctx, token)
 	if err != nil {
 		return nil, newIntrospectInactiveTokenError()
@@ -333,6 +333,13 @@ func (h *Handler) introspectAccessToken(ctx context.Context, token string) (*Int
 
 	client, err := h.Storage.GetClient(ctx, clientID)
 	if err != nil {
+		// A token whose client has been deleted no longer resolves on this
+		// server, so RFC 7662 §2.2 wants it reported as inactive rather than as
+		// a server error. This mirrors how the refresh-token path treats a
+		// missing token. Any other storage failure is a real server error.
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, newIntrospectInactiveTokenError()
+		}
 		h.Logger.ErrorContext(ctx, "error while fetching client from storage", "err", err.Error())
 		return nil, newIntrospectInternalServerError()
 	}

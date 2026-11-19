@@ -14,8 +14,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -610,6 +613,148 @@ func TestHandleCallback(t *testing.T) {
 	}
 }
 
+func TestHandleCallbackAllowedGroups(t *testing.T) {
+	baseToken := func(groups interface{}) map[string]interface{} {
+		tok := map[string]interface{}{
+			"sub":            "subvalue",
+			"name":           "namevalue",
+			"email":          "emailvalue",
+			"email_verified": true,
+		}
+		if groups != nil {
+			tok["groups"] = groups
+		}
+		return tok
+	}
+
+	tests := []struct {
+		name                 string
+		insecureEnableGroups bool
+		allowedGroups        []string
+		token                map[string]interface{}
+		expectGroups         []string
+		expectError          string
+	}{
+		{
+			name:          "list set and flag unset allows a member without passing groups through",
+			allowedGroups: []string{"admins"},
+			token:         baseToken([]string{"admins", "developers"}),
+			expectGroups:  nil,
+		},
+		{
+			name:          "list set and flag unset denies a non-member",
+			allowedGroups: []string{"admins"},
+			token:         baseToken([]string{"developers"}),
+			expectError:   "user not a member of allowed groups",
+		},
+		{
+			name:          "list set and flag unset denies a missing claim",
+			allowedGroups: []string{"admins"},
+			token:         baseToken(nil),
+			expectError:   "user not a member of allowed groups",
+		},
+		{
+			name:          "list set and flag unset denies an empty claim",
+			allowedGroups: []string{"admins"},
+			token:         baseToken([]string{}),
+			expectError:   "user not a member of allowed groups",
+		},
+		{
+			name:                 "list set and flag set filters groups as before",
+			insecureEnableGroups: true,
+			allowedGroups:        []string{"admins"},
+			token:                baseToken([]string{"admins", "developers"}),
+			expectGroups:         []string{"admins"},
+		},
+		{
+			name:                 "list set and flag set denies a non-member",
+			insecureEnableGroups: true,
+			allowedGroups:        []string{"admins"},
+			token:                baseToken([]string{"developers"}),
+			expectError:          "user not a member of allowed groups",
+		},
+		{
+			name:         "list unset and flag unset passes no groups",
+			token:        baseToken([]string{"admins", "developers"}),
+			expectGroups: nil,
+		},
+		{
+			name:                 "list unset and flag set passes all groups",
+			insecureEnableGroups: true,
+			token:                baseToken([]string{"admins", "developers"}),
+			expectGroups:         []string{"admins", "developers"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			testServer, err := setupServer(tc.token, true)
+			require.NoError(t, err)
+			defer testServer.Close()
+
+			serverURL := testServer.URL
+			basicAuth := true
+			config := Config{
+				Issuer:               serverURL,
+				ClientID:             "clientID",
+				ClientSecret:         "clientSecret",
+				Scopes:               []string{"email", "groups"},
+				RedirectURI:          fmt.Sprintf("%s/callback", serverURL),
+				InsecureEnableGroups: tc.insecureEnableGroups,
+				AllowedGroups:        tc.allowedGroups,
+				BasicAuthUnsupported: &basicAuth,
+			}
+			conn, err := newConnector(config)
+			require.NoError(t, err)
+			defer conn.Close()
+
+			req, err := newRequestWithAuthCode(serverURL, "someCode")
+			require.NoError(t, err)
+
+			identity, err := conn.HandleCallback(connector.Scopes{Groups: true}, nil, req)
+			if tc.expectError != "" {
+				require.ErrorContains(t, err, tc.expectError)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.expectGroups, identity.Groups)
+		})
+	}
+}
+
+func TestAllowedGroupsStartupWarning(t *testing.T) {
+	testServer, err := setupServer(map[string]interface{}{
+		"sub":            "subvalue",
+		"name":           "namevalue",
+		"email":          "emailvalue",
+		"email_verified": true,
+	}, true)
+	require.NoError(t, err)
+	defer testServer.Close()
+
+	serverURL := testServer.URL
+	basicAuth := true
+	config := Config{
+		Issuer:               serverURL,
+		ClientID:             "clientID",
+		ClientSecret:         "clientSecret",
+		Scopes:               []string{"email", "groups"},
+		RedirectURI:          fmt.Sprintf("%s/callback", serverURL),
+		AllowedGroups:        []string{"admins"},
+		BasicAuthUnsupported: &basicAuth,
+	}
+
+	var logs bytes.Buffer
+	c, err := config.Open("test-connector", slog.New(slog.NewTextHandler(&logs, nil)))
+	require.NoError(t, err)
+	conn, ok := c.(*oidcConnector)
+	require.True(t, ok)
+	defer conn.Close()
+
+	require.Contains(t, logs.String(), "allowedGroups")
+	require.Contains(t, logs.String(), "insecureEnableGroups")
+}
+
 func TestRefresh(t *testing.T) {
 	t.Helper()
 
@@ -861,6 +1006,81 @@ func TestTokenIdentityRootCAsWithOverride(t *testing.T) {
 
 	expectEquals(t, identity.UserID, "subvalue")
 	expectEquals(t, identity.Username, "namevalue")
+}
+
+func TestTokenIdentityKeysFetchTimeout(t *testing.T) {
+	defer func(timeout time.Duration) { jwksFetchTimeout = timeout }(jwksFetchTimeout)
+	jwksFetchTimeout = 200 * time.Millisecond
+
+	backend, err := setupServer(map[string]any{
+		"sub":  "subvalue",
+		"name": "namevalue",
+	}, true)
+	require.NoError(t, err)
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+	proxy := httputil.NewSingleHostReverseProxy(backendURL)
+
+	// While keysDown is set, the keys endpoint accepts the connection and
+	// never answers. stop releases a hanging request when the test ends.
+	var keysDown atomic.Bool
+	keysDown.Store(true)
+	stop := make(chan struct{})
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/keys" && keysDown.Load() {
+			select {
+			case <-r.Context().Done():
+			case <-stop:
+			}
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer testServer.Close()
+	defer close(stop)
+
+	conn, err := newConnector(Config{
+		Issuer: testServer.URL,
+		Scopes: []string{"openid", "groups"},
+	})
+	require.NoError(t, err)
+
+	res, err := http.Get(testServer.URL + "/token")
+	require.NoError(t, err)
+	defer res.Body.Close()
+	var tokenResponse map[string]any
+	require.NoError(t, json.NewDecoder(res.Body).Decode(&tokenResponse))
+	idToken := tokenResponse["id_token"].(string)
+
+	const tokenTypeID = "urn:ietf:params:oauth:token-type:id_token"
+	ctx := context.Background()
+
+	// Run the exchange in the background so the test fails instead of hanging
+	// when the key fetch has no limit.
+	errc := make(chan error, 1)
+	go func() {
+		_, err := conn.TokenIdentity(ctx, tokenTypeID, idToken)
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		require.Error(t, err)
+	case <-time.After(jwksFetchTimeout + 2*time.Second):
+		t.Fatal("token exchange hung, the key fetch is not bounded")
+	}
+
+	// The failed fetch does not stick: once the keys endpoint answers, the
+	// next exchange verifies. go-oidc signals the failed fetch before it clears
+	// it, so a call right after can still get the old error: retry briefly.
+	keysDown.Store(false)
+	var identity connector.Identity
+	require.Eventually(t, func() bool {
+		var err error
+		identity, err = conn.TokenIdentity(ctx, tokenTypeID, idToken)
+		return err == nil
+	}, 5*time.Second, 10*time.Millisecond)
+	expectEquals(t, identity.UserID, "subvalue")
 }
 
 func TestPromptType(t *testing.T) {
@@ -1337,4 +1557,107 @@ func TestHandleCallbackUserInfoSubMatch(t *testing.T) {
 			expectEquals(t, identity.UserID, "subvalue")
 		})
 	}
+}
+
+func TestTokenIdentityKeysUnavailable(t *testing.T) {
+	backend, err := setupServer(map[string]any{
+		"sub":  "subvalue",
+		"name": "namevalue",
+	}, true)
+	require.NoError(t, err)
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	require.NoError(t, err)
+	proxy := httputil.NewSingleHostReverseProxy(backendURL)
+
+	// While keysDown is set, the keys endpoint fails.
+	var keysDown atomic.Bool
+	keysDown.Store(true)
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/keys" && keysDown.Load() {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer testServer.Close()
+
+	conn, err := newConnector(Config{
+		Issuer: testServer.URL,
+		Scopes: []string{"openid", "groups"},
+	})
+	require.NoError(t, err)
+
+	res, err := http.Get(testServer.URL + "/token")
+	require.NoError(t, err)
+	defer res.Body.Close()
+	var tokenResponse map[string]any
+	require.NoError(t, json.NewDecoder(res.Body).Decode(&tokenResponse))
+	idToken := tokenResponse["id_token"].(string)
+
+	const tokenTypeID = "urn:ietf:params:oauth:token-type:id_token"
+	ctx := context.Background()
+
+	var unavailableErr *connector.UpstreamUnavailableError
+	_, err = conn.TokenIdentity(ctx, tokenTypeID, idToken)
+	require.ErrorAs(t, err, &unavailableErr)
+
+	keysDown.Store(false)
+	identity, err := conn.TokenIdentity(ctx, tokenTypeID, idToken)
+	require.NoError(t, err)
+	expectEquals(t, identity.UserID, "subvalue")
+
+	// A token signed with another key does not verify. That is not an outage.
+	otherKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	require.NoError(t, err)
+	forged, err := newToken(&jose.JSONWebKey{Key: otherKey, KeyID: "keyId", Algorithm: "RSA"}, map[string]any{
+		"iss": testServer.URL,
+		"sub": "subvalue",
+		"aud": "clientID",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	require.NoError(t, err)
+	_, err = conn.TokenIdentity(ctx, tokenTypeID, forged)
+	require.Error(t, err)
+	require.False(t, errors.As(err, &unavailableErr), "a token that does not verify is not an upstream outage: %v", err)
+}
+
+func TestTokenIdentityAlgFetchingKeys(t *testing.T) {
+	backend, err := setupServer(map[string]any{"sub": "subvalue"}, true)
+	require.NoError(t, err)
+	defer backend.Close()
+	conn, err := newConnector(Config{Issuer: backend.URL, Scopes: []string{"openid"}})
+	require.NoError(t, err)
+
+	// go-jose puts the header's alg into its parse error, so the token
+	// controls this text. It must not turn into an upstream outage.
+	enc := base64.RawURLEncoding.EncodeToString
+	token := enc([]byte(`{"alg":"fetching keys","kid":"keyId"}`)) + "." + enc([]byte(`{"sub":"subvalue"}`)) + "." + enc([]byte("sig"))
+
+	_, err = conn.TokenIdentity(context.Background(), "urn:ietf:params:oauth:token-type:id_token", token)
+
+	require.Error(t, err)
+	var unavailableErr *connector.UpstreamUnavailableError
+	require.False(t, errors.As(err, &unavailableErr), "a malformed token is not an upstream outage: %v", err)
+}
+
+func TestTokenIdentityCanceled(t *testing.T) {
+	backend, err := setupServer(map[string]any{"sub": "subvalue"}, true)
+	require.NoError(t, err)
+	defer backend.Close()
+	conn, err := newConnector(Config{Issuer: backend.URL, Scopes: []string{"openid"}})
+	require.NoError(t, err)
+	res, err := http.Get(backend.URL + "/token")
+	require.NoError(t, err)
+	defer res.Body.Close()
+	var tokenResponse map[string]any
+	require.NoError(t, json.NewDecoder(res.Body).Decode(&tokenResponse))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = conn.TokenIdentity(ctx, "urn:ietf:params:oauth:token-type:id_token", tokenResponse["id_token"].(string))
+
+	require.Error(t, err)
+	var unavailableErr *connector.UpstreamUnavailableError
+	require.False(t, errors.As(err, &unavailableErr), "a canceled request is not an upstream outage: %v", err)
 }

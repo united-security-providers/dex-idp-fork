@@ -95,6 +95,16 @@ func (g *refresh) Authorize(ctx context.Context, req *Request, client storage.Cl
 	if g.sessionsEnabled {
 		ui, err := g.storage.GetUserIdentity(ctx, refreshToken.Claims.UserID, refreshToken.ConnectorID)
 		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				// No identity was persisted for this token — minted before
+				// sessions were enabled, or by the password grant before it
+				// recorded one. Under sessions there are no cached claims to
+				// refresh against, so the token can no longer be honored:
+				// invalid_grant, not a server fault.
+				g.logger.InfoContext(ctx, "refresh: refused, no stored user identity",
+					"client_id", refreshToken.ClientID, "user_id", refreshToken.Claims.UserID)
+				return nil, &oauth2.Error{Type: oauth2.InvalidGrant, Description: "No user identity is stored for this refresh token.", Status: http.StatusBadRequest}
+			}
 			g.logger.ErrorContext(ctx, "failed to get user identity", "err", err)
 			return nil, &oauth2.Error{Type: oauth2.InvalidRequest, Status: http.StatusInternalServerError}
 		}
@@ -336,9 +346,13 @@ func rotateError(err error) *oauth2.Error {
 }
 
 // upstreamRejected reports whether the upstream answered the connector's refresh
-// with invalid_grant. That is the expected end of the user's session there, not a
-// server fault, so it is logged at info rather than error.
+// with invalid_grant, or the connector found the user deleted or disabled. That is
+// the expected end of the user's session there, not a server fault, so it is
+// logged at info rather than error.
 func upstreamRejected(err error) bool {
+	if errors.Is(err, connector.ErrUserRevoked) {
+		return true
+	}
 	var retrieveErr *xoauth2.RetrieveError
 	return errors.As(err, &retrieveErr) && retrieveErr.ErrorCode == oauth2.InvalidGrant
 }

@@ -75,8 +75,12 @@ type Config struct {
 	InsecureSkipEmailVerified bool `json:"insecureSkipEmailVerified"`
 
 	// InsecureEnableGroups enables groups claims. This is disabled by default until https://github.com/dexidp/dex/issues/1065 is resolved
-	InsecureEnableGroups bool     `json:"insecureEnableGroups"`
-	AllowedGroups        []string `json:"allowedGroups"`
+	InsecureEnableGroups bool `json:"insecureEnableGroups"`
+	// AllowedGroups restricts login to users in at least one of the listed
+	// groups. The groups claim is read for this check even when
+	// insecureEnableGroups is not set; the groups are then not included in the
+	// identity.
+	AllowedGroups []string `json:"allowedGroups"`
 
 	// AcrValues (Authentication Context Class Reference Values) that specifies the Authentication Context Class Values
 	// within the Authentication Request that the Authorization Server is being requested to use for
@@ -150,6 +154,9 @@ type ProviderDiscoveryOverrides struct {
 func (o *ProviderDiscoveryOverrides) Empty() bool {
 	return o.TokenURL == "" && o.AuthURL == "" && o.JWKSURL == "" && o.UserInfoURL == "" && o.DeviceAuthURL == "" && o.EndSessionURL == ""
 }
+
+// jwksFetchTimeout bounds a fetch of the issuer's signing keys.
+var jwksFetchTimeout = 5 * time.Second
 
 func getProvider(ctx context.Context, issuer string, overrides ProviderDiscoveryOverrides) (*oidc.Provider, error) {
 	provider, err := oidc.NewProvider(ctx, issuer)
@@ -286,6 +293,10 @@ func (c *Config) Open(id string, logger *slog.Logger) (conn connector.Connector,
 		return nil, fmt.Errorf("support for the Hosted domains option had been deprecated and removed, consider switching to the Google connector")
 	}
 
+	if len(c.AllowedGroups) > 0 && !c.InsecureEnableGroups {
+		logger.Warn("allowedGroups is set without insecureEnableGroups: group membership will be checked, but groups will not be included in the identity", "connector_id", id)
+	}
+
 	httpClient, err := httpclient.NewHTTPClient(c.RootCAs, c.InsecureSkipVerify)
 	if err != nil {
 		return nil, err
@@ -375,6 +386,17 @@ func (c *Config) Open(id string, logger *slog.Logger) (conn connector.Connector,
 		}
 	}
 
+	// go-oidc fetches the issuer's signing keys in the background, on a context
+	// detached from the request, and every verification that needs the keys
+	// waits on that one fetch. httpClient has no overall timeout, so a keys
+	// endpoint that accepts the connection and never answers would stall every
+	// verification. Bound the key fetch, keeping the transport so rootCAs and
+	// proxy settings still apply.
+	keysCtx := context.WithValue(ctx, oauth2.HTTPClient, &http.Client{
+		Transport: httpClient.Transport,
+		Timeout:   jwksFetchTimeout,
+	})
+
 	clientID := c.ClientID
 	return &oidcConnector{
 		provider:    provider,
@@ -386,10 +408,8 @@ func (c *Config) Open(id string, logger *slog.Logger) (conn connector.Connector,
 			Scopes:       scopes,
 			RedirectURL:  c.RedirectURI,
 		},
-		verifier: provider.VerifierContext(
-			ctx, // Pass our ctx with customized http.Client
-			&oidc.Config{ClientID: clientID},
-		),
+		verifier:                  provider.VerifierContext(keysCtx, &oidc.Config{ClientID: clientID}),
+		exchangeVerifier:          provider.VerifierContext(keysCtx, &oidc.Config{SkipClientIDCheck: true}),
 		logger:                    logger.With(slog.Group("connector", "type", "oidc", "id", id)),
 		cancel:                    cancel,
 		httpClient:                httpClient,
@@ -426,6 +446,7 @@ type oidcConnector struct {
 	redirectURI               string
 	oauth2Config              *oauth2.Config
 	verifier                  *oidc.IDTokenVerifier
+	exchangeVerifier          *oidc.IDTokenVerifier
 	cancel                    context.CancelFunc
 	logger                    *slog.Logger
 	httpClient                *http.Client
@@ -571,13 +592,28 @@ func (c *oidcConnector) TokenIdentity(ctx context.Context, subjectTokenType, sub
 	return c.createIdentity(ctx, identity, token, exchangeCaller)
 }
 
+// verifyError wraps err from a token verification with msg. A failure to fetch
+// the issuer's signing keys becomes a connector.UpstreamUnavailableError,
+// unless ctx was canceled, because then the request ended and not the upstream.
+// go-oidc formats that failure into the verification error with %v, so it can
+// only be recognized by go-oidc's wording. The whole prefix is matched because
+// other parse errors quote the token's header, which the caller controls.
+func verifyError(ctx context.Context, msg string, err error) error {
+	unavailable := strings.HasPrefix(err.Error(), "failed to verify signature: fetching keys") && ctx.Err() == nil
+	err = fmt.Errorf("%s: %v", msg, err)
+	if unavailable {
+		return &connector.UpstreamUnavailableError{Err: err}
+	}
+	return err
+}
+
 func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.Identity, token *oauth2.Token, caller caller) (connector.Identity, error) {
 	var claims map[string]interface{}
 
 	if rawIDToken, ok := token.Extra("id_token").(string); ok {
 		idToken, err := c.verifier.Verify(ctx, rawIDToken)
 		if err != nil {
-			return identity, fmt.Errorf("oidc: failed to verify ID Token: %v", err)
+			return identity, verifyError(ctx, "oidc: failed to verify ID Token", err)
 		}
 
 		if err := idToken.Claims(&claims); err != nil {
@@ -587,9 +623,9 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
 		switch token.TokenType {
 		case "urn:ietf:params:oauth:token-type:id_token":
 			// Verify only works on ID tokens
-			idToken, err := c.provider.Verifier(&oidc.Config{SkipClientIDCheck: true}).Verify(ctx, token.AccessToken)
+			idToken, err := c.exchangeVerifier.Verify(ctx, token.AccessToken)
 			if err != nil {
-				return identity, fmt.Errorf("oidc: failed to verify token: %v", err)
+				return identity, verifyError(ctx, "oidc: failed to verify token", err)
 			}
 			if err := idToken.Claims(&claims); err != nil {
 				return identity, fmt.Errorf("oidc: failed to decode claims: %v", err)
@@ -678,8 +714,9 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
 		}
 	}
 
+	// allowedGroups is a login condition, so read the claim for it even without insecureEnableGroups.
 	var groups []string
-	if c.insecureEnableGroups {
+	if c.insecureEnableGroups || len(c.allowedGroups) > 0 {
 		groupsKey := "groups"
 		vs, found := claims[groupsKey].([]interface{})
 		if (!found || c.overrideClaimMapping) && c.groupsKey != "" {
@@ -724,7 +761,11 @@ func (c *oidcConnector) createIdentity(ctx context.Context, identity connector.I
 				return identity, fmt.Errorf("user not a member of allowed groups")
 			}
 
-			groups = groupMatches
+			if c.insecureEnableGroups {
+				groups = groupMatches
+			} else {
+				groups = nil
+			}
 		}
 	}
 
